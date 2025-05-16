@@ -1,58 +1,28 @@
 package main
 
 import (
-	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 	"sync"
 
+	"github.com/forPelevin/gomoji"
 	"github.com/gocolly/colly"
 )
 
+// Define a struct to hold job data
+type Job struct {
+	Title     string   `json:"title"`
+	Company   string   `json:"company"`
+	Locations []string `json:"locations"`
+	Salary    string   `json:"salary"`
+}
+
 func main() {
-	file, err := os.Create("jobs.csv")
-	if err != nil {
-		log.Fatalf("Could not create file: %v", err)
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	writer.Write([]string{"Job Title", "Company", "Location", "Salary"})
-
-	// Create a new asynchronous collector with parallelism limit
-	c := colly.NewCollector(
-		colly.Async(true),
-	)
-
-	c.Limit((&colly.LimitRule{
-		DomainGlob:  "*",
-		Parallelism: 3,
-	}))
-
-	var wg sync.WaitGroup // WaitGroup to track when all URLs are fully scraped
-
-	c.OnHTML("tr.job", func(e *colly.HTMLElement) {
-		jobTitle := strings.TrimSpace(e.DOM.Find("h2[itemprop='title']").Text())
-		company := strings.TrimSpace(e.DOM.Find("h3[itemprop='name']").Text())
-		locations := e.DOM.Find("div.location")
-		location := locations.Eq(0).Text()
-		salary := locations.Eq(1).Text()
-
-		err := writer.Write([]string{jobTitle, company, location, salary})
-		if err != nil {
-			log.Printf("Could not write record to CSV: %v", err)
-		}
-
-		fmt.Printf("Job Title: %s\nCompany: %s\nLocation: %s\nSalary: %s\n----\n", jobTitle, company, location, salary)
-	})
-
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting", r.URL.String())
-	})
+	var jobs []Job
+	var mu sync.Mutex // Protect jobs slice during concurrent writes
 
 	urls := []string{
 		"https://remoteok.com/remote-javascript-jobs",
@@ -60,22 +30,80 @@ func main() {
 		"https://remoteok.com/remote-go-jobs",
 	}
 
-	// Add a counter for each URL visit, then visit asynchronously
+	c := colly.NewCollector(
+		colly.Async(true),
+	)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: len(urls),
+	})
+
+	var wg sync.WaitGroup
+
+	c.OnHTML("tr.job", func(e *colly.HTMLElement) {
+		jobTitle := strings.TrimSpace(e.ChildText("h2[itemprop='title']"))
+		company := strings.TrimSpace(e.ChildText("h3[itemprop='name']"))
+
+		var locations []string
+		salary := ""
+
+		e.ForEach("div.location", func(_ int, el *colly.HTMLElement) {
+			text := strings.TrimSpace(el.Text)
+			if strings.Contains(text, "$") || strings.Contains(text, "💰") {
+				text = strings.TrimSpace(gomoji.RemoveEmojis(text))
+				salary = text
+			} else {
+				text = strings.TrimSpace(gomoji.RemoveEmojis(text))
+				locations = append(locations, text)
+			}
+		})
+
+		job := Job{
+			Title:     jobTitle,
+			Company:   company,
+			Locations: locations,
+			Salary:    salary,
+		}
+
+		// Append safely using mutex
+		mu.Lock()
+		jobs = append(jobs, job)
+		mu.Unlock()
+
+		fmt.Printf("Job: %+v\n----\n", job)
+	})
+
+	c.OnRequest(func(r *colly.Request) {
+		fmt.Println("Visiting", r.URL.String())
+	})
+
 	for _, url := range urls {
 		wg.Add(1)
 		if err := c.Visit(url); err != nil {
-			log.Fatalf("Failed to visit page: %v", err)
+			log.Fatalf("Failed to visit %s: %v", url, err)
 		}
 	}
 
-	// Called once each page scraping finishes, signals WaitGroup to decrement
-	c.OnScraped(func(r *colly.Response) {
+	c.OnScraped(func(_ *colly.Response) {
 		wg.Done()
 	})
 
-	// Wait until all pages have finished scraping
 	wg.Wait()
-
-	// Wait for all asynchronous requests to complete before exiting
 	c.Wait()
+
+	// Write jobs to JSON
+	file, err := os.Create("jobs.json")
+	if err != nil {
+		log.Fatalf("Could not create JSON file: %v", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // Pretty print
+	if err := encoder.Encode(jobs); err != nil {
+		log.Fatalf("Could not encode JSON: %v", err)
+	}
+
+	fmt.Println("Scraped jobs saved to jobs.json")
 }
